@@ -1,18 +1,18 @@
 [project]
 name = "splatfacto-w"
 description = "Splatfacto in the Wild"
-version = "0.1.5"
+version = "0.1.6"
 
-dependencies = ["nerfstudio >= 1.1.0"] 
+dependencies = [
+    "nerfstudio>=1.1.5,<1.2",
+]
 
 [tool.setuptools.packages.find]
 include = ["splatfactow*", "splatfactow_light*"]
 
-# register the entry point of your new method here:
 [project.entry-points.'nerfstudio.method_configs']
 splatfactow = 'splatfactow.splatfactow_config:splatfactow_config'
 splatfactow_light = 'splatfactow.splatfactow_config:splatfactow_light_config'
 
-# register the dataparser config
 [project.entry-points.'nerfstudio.dataparser_configs']
 splatfactow_dataparser = 'splatfactow.nerfw_dataparser:splatfactow_dataparser'

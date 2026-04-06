@@ -1,129 +1,103 @@
-# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors.
+# Licensed under the Apache License, Version 2.0.
 
-"""Phototourism dataset parser. Datasets and documentation here: http://phototour.cs.washington.edu/datasets/"""
+"""Phototourism / NeRF-W dataset parser for Splatfacto-W.
+
+This version keeps the original training behavior but fixes a few structural issues:
+- consistently uses config.colmap_path,
+- iterates COLMAP images correctly (image ids != camera ids),
+- validates TSV split files more carefully,
+- keeps a stable mapping from eval-dataset indices to original image indices.
+"""
 
 from __future__ import annotations
-import pandas as pd
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Type
 
 import numpy as np
+import pandas as pd
 import torch
 
 from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import Cameras, CameraType
-from nerfstudio.data.dataparsers.base_dataparser import (
-    DataParser,
-    DataParserConfig,
-    DataparserOutputs,
-)
+from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils import colmap_parsing_utils as colmap_utils
 from nerfstudio.plugins.registry_dataparser import DataParserSpecification
-
-# TODO(1480) use pycolmap instead of colmap_parsing_utils
-# import pycolmap
-from nerfstudio.data.utils.colmap_parsing_utils import (
-    read_cameras_binary,
-    read_images_binary,
-)
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
 @dataclass
 class NerfWDataParserConfig(DataParserConfig):
-    """Phototourism dataset parser config"""
-
     _target: Type = field(default_factory=lambda: NerfW)
-    """target class to instantiate"""
     data: Path = Path("data/brandenburg-gate")
-    """Directory specifying location of data."""
     data_name: Literal["brandenburg", "trevi", "sacre"] = "brandenburg"
-    """Name of the dataset."""
     scale_factor: float = 3.0
-    """How much to scale the camera origins by."""
     alpha_color: str = "white"
-    """alpha color of background"""
     scene_scale: float = 1.0
-    """How much to scale the region of interest by."""
     orientation_method: Literal["pca", "up", "vertical", "none"] = "up"
-    """The method to use for orientation."""
     center_method: Literal["poses", "focus", "none"] = "poses"
-    """The method to use to center the poses."""
     auto_scale_poses: bool = True
-    """Whether to automatically scale the poses to fit in +/- 1 bounding box."""
     colmap_path: Path = Path("dense/sparse")
     load_3D_points: bool = True
-    """Whether to load the 3D points from the colmap reconstruction. This is helpful for Gaussian splatting and
-    generally unused otherwise, but it's typically harmless so we default to True."""
     depth_unit_scale_factor: float = 1e-3
-    """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
     downscale_factor: Optional[int] = None
-    """How much to downscale images. If not set, images are chosen such that the max dimension is <1600px."""
     max_2D_matches_per_3D_point: int = 0
-    """Maximum number of 2D matches per 3D point. If set to -1, all 2D matches are loaded. If set to 0, no 2D matches are loaded."""
 
 
 @dataclass
 class NerfW(DataParser):
-    """Phototourism dataset. This is based on https://github.com/kwea123/nerf_pl/blob/nerfw/datasets/phototourism.py
-    and uses colmap's utils file to read the poses.
-    """
-
     config: NerfWDataParserConfig
 
     def __init__(self, config: NerfWDataParserConfig):
         super().__init__(config=config)
         self.data: Path = config.data
-        self.i_eval = None
+        self.i_eval: list[int] = []
 
-    def _generate_dataparser_outputs(self, split="train"):
-        image_filenames = []
-        poses = []
-        colmap_path = self.data / self.config.colmap_path
-        with CONSOLE.status(
-            f"[bold green]Reading phototourism images and poses for {split} split..."
-        ) as _:
-            cams = read_cameras_binary(self.data / "dense/sparse/cameras.bin")
-            imgs = read_images_binary(self.data / "dense/sparse/images.bin")
-
-        poses = []
-        fxs = []
-        fys = []
-        cxs = []
-        cys = []
-        image_filenames = []
-
-        flip = torch.eye(3)
-        flip[0, 0] = -1.0
-        flip = flip.double()
-
-        # Load the TSV file to get the train/eval split
+    def _load_split_file(self) -> pd.DataFrame:
         split_file = self.data / f"{self.config.data_name}.tsv"
-        split_data = pd.read_csv(split_file, sep="\t")
-        # kick lines that is NA
-        split_data = split_data.dropna()
+        if not split_file.exists():
+            raise FileNotFoundError(f"Missing NeRF-W split file: {split_file}")
 
-        for _id, cam in cams.items():
-            img = imgs[_id]
-            if img.name not in split_data[:]["filename"].values:
+        split_data = pd.read_csv(split_file, sep="\t").dropna()
+        required_cols = {"filename", "split"}
+        missing = required_cols - set(split_data.columns)
+        if missing:
+            raise ValueError(f"Split file {split_file} is missing columns: {sorted(missing)}")
+        split_data["filename"] = split_data["filename"].astype(str)
+        split_data["split"] = split_data["split"].astype(str).str.lower()
+        return split_data
+
+    def _generate_dataparser_outputs(self, split: str = "train") -> DataparserOutputs:
+        image_filenames: list[Path] = []
+        poses: list[torch.Tensor] = []
+        fxs: list[torch.Tensor] = []
+        fys: list[torch.Tensor] = []
+        cxs: list[torch.Tensor] = []
+        cys: list[torch.Tensor] = []
+
+        colmap_path = self.data / self.config.colmap_path
+        cameras_path = colmap_path / "cameras.bin"
+        images_path = colmap_path / "images.bin"
+
+        with CONSOLE.status(f"[bold green]Reading phototourism images and poses for {split} split..."):
+            cams = colmap_utils.read_cameras_binary(cameras_path)
+            imgs = colmap_utils.read_images_binary(images_path)
+
+        split_data = self._load_split_file()
+        split_filenames = set(split_data["filename"].tolist())
+
+        # Iterate images, then resolve the owning camera via image.camera_id.
+        for _, img in sorted(imgs.items(), key=lambda kv: kv[1].name):
+            if img.name not in split_filenames:
                 continue
-            assert (
-                cam.model == "PINHOLE"
-            ), "Only pinhole (perspective) camera model is supported at the moment"
+            cam = cams[img.camera_id]
+            if cam.model != "PINHOLE":
+                raise ValueError(
+                    f"Only PINHOLE cameras are currently supported; got {cam.model} for image {img.name}"
+                )
 
             pose = torch.cat(
                 [torch.tensor(img.qvec2rotmat()), torch.tensor(img.tvec.reshape(3, 1))],
@@ -135,89 +109,77 @@ class NerfW(DataParser):
             fys.append(torch.tensor(cam.params[1]))
             cxs.append(torch.tensor(cam.params[2]))
             cys.append(torch.tensor(cam.params[3]))
-
             image_filenames.append(self.data / "dense/images" / img.name)
 
-        poses = torch.stack(poses).float()
-        poses[..., 1:3] *= -1
-        fxs = torch.stack(fxs).float()
-        fys = torch.stack(fys).float()
-        cxs = torch.stack(cxs).float()
-        cys = torch.stack(cys).float()
+        if not image_filenames:
+            raise ValueError(f"No valid images found for dataset at {self.data}")
 
-        all_indices = torch.arange(len(image_filenames))
-        # Create a mapping from image filenames to indices
-        filename_to_index = {name: idx for idx, name in enumerate(image_filenames)}
-        # Get the indices of the eval set in all indices
-        eval_indices = [
-            filename_to_index[self.data / "dense/images" / name]
-            for name in split_data[split_data["split"] == "test"]["filename"].values
-        ]
+        poses_t = torch.stack(poses).float()
+        poses_t[..., 1:3] *= -1
+        fxs_t = torch.stack(fxs).float()
+        fys_t = torch.stack(fys).float()
+        cxs_t = torch.stack(cxs).float()
+        cys_t = torch.stack(cys).float()
 
-        eval_indices = torch.tensor(
-            eval_indices,
-            dtype=torch.long,
-        )
+        filename_to_index = {path.name: idx for idx, path in enumerate(image_filenames)}
+        eval_names = split_data.loc[split_data["split"] == "test", "filename"].tolist()
+        eval_indices = [filename_to_index[name] for name in eval_names if name in filename_to_index]
+        eval_indices_t = torch.tensor(eval_indices, dtype=torch.long)
+        self.i_eval = eval_indices
 
-        self.i_eval = eval_indices.tolist()
-        # Print eval indices and corresponding filenames
-        print(f"eval_indices: {eval_indices}")
-        eval_filenames = [image_filenames[i] for i in eval_indices]
-        print(f"eval_filenames: {eval_filenames}")
+        CONSOLE.log(f"eval_indices: {eval_indices_t}")
+        CONSOLE.log(f"eval_filenames: {[image_filenames[i] for i in eval_indices]}")
 
+        all_indices = torch.arange(len(image_filenames), dtype=torch.long)
         if split == "train":
+            # Preserve original behavior: keep all images in train, while the datamanager
+            # applies masking to eval-designated images.
             indices = all_indices
-        elif split == "val" or split == "test":
-            indices = eval_indices
+        elif split in {"val", "test"}:
+            indices = eval_indices_t
         else:
             raise ValueError(f"Unknown dataparser split {split}")
 
-        poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
-            poses,
+        poses_t, transform_matrix = camera_utils.auto_orient_and_center_poses(
+            poses_t,
             method=self.config.orientation_method,
             center_method=self.config.center_method,
         )
 
-        # Scale poses
         scale_factor = 1.0
         if self.config.auto_scale_poses:
-            scale_factor /= float(torch.max(torch.abs(poses[:, :3, 3])))
+            scale_factor /= float(torch.max(torch.abs(poses_t[:, :3, 3])).clamp_min(1e-6))
         scale_factor *= self.config.scale_factor
+        poses_t[:, :3, 3] *= scale_factor
 
-        poses[:, :3, 3] *= scale_factor
-
-        # in x,y,z order
-        # assumes that the scene is centered at the origin
         aabb_scale = self.config.scene_scale
         scene_box = SceneBox(
             aabb=torch.tensor(
-                [
-                    [-aabb_scale, -aabb_scale, -aabb_scale],
-                    [aabb_scale, aabb_scale, aabb_scale],
-                ],
+                [[-aabb_scale, -aabb_scale, -aabb_scale], [aabb_scale, aabb_scale, aabb_scale]],
                 dtype=torch.float32,
             )
         )
 
         cameras = Cameras(
-            camera_to_worlds=poses[:, :3, :4],
-            fx=fxs,
-            fy=fys,
-            cx=cxs,
-            cy=cys,
+            camera_to_worlds=poses_t[:, :3, :4],
+            fx=fxs_t,
+            fy=fys_t,
+            cx=cxs_t,
+            cy=cys_t,
             camera_type=CameraType.PERSPECTIVE,
         )
         cameras = cameras[indices]
-        image_filenames = [image_filenames[i] for i in indices]
-        metadata = {}
-        if split == "train":
-            metadata.update(
-                self._load_3D_points(colmap_path, transform_matrix, scale_factor)
-            )
-        assert len(cameras) == len(image_filenames)
+        selected_filenames = [image_filenames[i] for i in indices.tolist()]
 
-        dataparser_outputs = DataparserOutputs(
-            image_filenames=image_filenames,
+        metadata = {}
+        if split == "train" and self.config.load_3D_points:
+            metadata.update(self._load_3D_points(colmap_path, transform_matrix, scale_factor))
+
+        if len(cameras) != len(selected_filenames):
+            raise RuntimeError("Cameras / image filename count mismatch after split selection")
+
+        return DataparserOutputs(
+            image_filenames=selected_filenames,
             cameras=cameras,
             scene_box=scene_box,
             dataparser_scale=scale_factor,
@@ -225,111 +187,63 @@ class NerfW(DataParser):
             metadata=metadata,
         )
 
-        return dataparser_outputs
-
-    def _load_3D_points(
-        self, colmap_path: Path, transform_matrix: torch.Tensor, scale_factor: float
-    ):
+    def _load_3D_points(self, colmap_path: Path, transform_matrix: torch.Tensor, scale_factor: float):
         if (colmap_path / "points3D.bin").exists():
-            colmap_points = colmap_utils.read_points3D_binary(
-                colmap_path / "points3D.bin"
-            )
+            colmap_points = colmap_utils.read_points3D_binary(colmap_path / "points3D.bin")
         elif (colmap_path / "points3D.txt").exists():
-            colmap_points = colmap_utils.read_points3D_text(
-                colmap_path / "points3D.txt"
-            )
+            colmap_points = colmap_utils.read_points3D_text(colmap_path / "points3D.txt")
         else:
-            raise ValueError(
-                f"Could not find points3D.txt or points3D.bin in {colmap_path}"
-            )
-        points3D = torch.from_numpy(
-            np.array([p.xyz for p in colmap_points.values()], dtype=np.float32)
-        )
+            raise ValueError(f"Could not find points3D.txt or points3D.bin in {colmap_path}")
+
+        points3D = torch.from_numpy(np.array([p.xyz for p in colmap_points.values()], dtype=np.float32))
         points3D = (
-            torch.cat(
-                (
-                    points3D,
-                    torch.ones_like(points3D[..., :1]),
-                ),
-                -1,
-            )
+            torch.cat((points3D, torch.ones_like(points3D[..., :1])), dim=-1)
             @ transform_matrix.T
         )
         points3D *= scale_factor
 
-        # Load point colours
-        points3D_rgb = torch.from_numpy(
-            np.array([p.rgb for p in colmap_points.values()], dtype=np.uint8)
-        )
-        points3D_num_points = torch.tensor(
-            [len(p.image_ids) for p in colmap_points.values()], dtype=torch.int64
-        )
+        points3D_rgb = torch.from_numpy(np.array([p.rgb for p in colmap_points.values()], dtype=np.uint8))
+        points3D_num_points = torch.tensor([len(p.image_ids) for p in colmap_points.values()], dtype=torch.int64)
         out = {
             "points3D_xyz": points3D,
             "points3D_rgb": points3D_rgb,
-            "points3D_error": torch.from_numpy(
-                np.array([p.error for p in colmap_points.values()], dtype=np.float32)
-            ),
+            "points3D_error": torch.from_numpy(np.array([p.error for p in colmap_points.values()], dtype=np.float32)),
             "points3D_num_points2D": points3D_num_points,
         }
+
         if self.config.max_2D_matches_per_3D_point != 0:
             if (colmap_path / "images.txt").exists():
-                im_id_to_image = colmap_utils.read_images_text(
-                    colmap_path / "images.txt"
-                )
+                im_id_to_image = colmap_utils.read_images_text(colmap_path / "images.txt")
             elif (colmap_path / "images.bin").exists():
-                im_id_to_image = colmap_utils.read_images_binary(
-                    colmap_path / "images.bin"
-                )
+                im_id_to_image = colmap_utils.read_images_binary(colmap_path / "images.bin")
             else:
-                raise ValueError(
-                    f"Could not find images.txt or images.bin in {colmap_path}"
-                )
+                raise ValueError(f"Could not find images.txt or images.bin in {colmap_path}")
+
             downscale_factor = self._downscale_factor
             max_num_points = int(torch.max(points3D_num_points).item())
             if self.config.max_2D_matches_per_3D_point > 0:
-                max_num_points = min(
-                    max_num_points, self.config.max_2D_matches_per_3D_point
-                )
+                max_num_points = min(max_num_points, self.config.max_2D_matches_per_3D_point)
+
             points3D_image_ids = []
             points3D_image_xy = []
             for p in colmap_points.values():
                 nids = np.array(p.image_ids, dtype=np.int64)
                 nxy_ids = np.array(p.point2D_idxs, dtype=np.int32)
                 if self.config.max_2D_matches_per_3D_point != -1:
-                    # Randomly sample 2D matches
-                    idxs = np.argsort(p.error)[
-                        : self.config.max_2D_matches_per_3D_point
-                    ]
+                    idxs = np.argsort(p.error)[: self.config.max_2D_matches_per_3D_point]
                     nids = nids[idxs]
                     nxy_ids = nxy_ids[idxs]
-                nxy = [
-                    im_id_to_image[im_id].xys[pt_idx]
-                    for im_id, pt_idx in zip(nids, nxy_ids)
-                ]
-                nxy = torch.from_numpy(np.stack(nxy).astype(np.float32))
-                nids = torch.from_numpy(nids)
-                assert len(nids.shape) == 1
-                assert len(nxy.shape) == 2
+                nxy = [im_id_to_image[im_id].xys[pt_idx] for im_id, pt_idx in zip(nids, nxy_ids)]
+                nxy = torch.from_numpy(np.stack(nxy).astype(np.float32)) if len(nxy) else torch.zeros((0, 2), dtype=torch.float32)
+                nids_t = torch.from_numpy(nids)
                 points3D_image_ids.append(
-                    torch.cat(
-                        (
-                            nids,
-                            torch.full(
-                                (max_num_points - len(nids),), -1, dtype=torch.int64
-                            ),
-                        )
-                    )
+                    torch.cat((nids_t, torch.full((max_num_points - len(nids_t),), -1, dtype=torch.int64)))
                 )
                 points3D_image_xy.append(
                     torch.cat(
                         (
                             nxy,
-                            torch.full(
-                                (max_num_points - len(nxy), nxy.shape[-1]),
-                                0,
-                                dtype=torch.float32,
-                            ),
+                            torch.full((max_num_points - len(nxy), 2), 0, dtype=torch.float32),
                         )
                     )
                     / downscale_factor
@@ -338,11 +252,11 @@ class NerfW(DataParser):
             out["points3D_points2D_xy"] = torch.stack(points3D_image_xy, dim=0)
         return out
 
-    def check_in_eval(self, idx):
+    def check_in_eval(self, idx: int) -> bool:
         return idx in self.i_eval
 
-    def find_eval_idx(self, idx):
+    def find_eval_idx(self, idx: int) -> int:
         return self.i_eval[idx]
 
 
-splatfactow_dataparser=DataParserSpecification(config=NerfWDataParserConfig())
+splatfactow_dataparser = DataParserSpecification(config=NerfWDataParserConfig())

@@ -31,6 +31,7 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.models.splatfacto import SplatfactoModel
 from splatfactow.splatfactow_field import BGField, SplatfactoWField
 
 
@@ -150,8 +151,7 @@ class SplatfactoWModelConfig(ModelConfig):
     tile_size: int = 16
     """Forward-looking knob kept separate so future gsplat updates are localized."""
 
-
-class SplatfactoWModel(Model):
+class SplatfactoWModel(SplatfactoModel):
     config: SplatfactoWModelConfig
 
     def __init__(

@@ -218,9 +218,17 @@ if __name__ == "__main__":
     parser.add_argument("--camera_idx", type=int, help="Camera index to use for export appearance.")
     args = parser.parse_args()
 
-    obb_center = tuple(map(float, args.obb_center.split(","))) if args.obb_center else None
-    obb_rotation = tuple(map(float, args.obb_rotation.split(","))) if args.obb_rotation else None
-    obb_scale = tuple(map(float, args.obb_scale.split(","))) if args.obb_scale else None
+    def parse_vec3(value: Optional[str]) -> Optional[Tuple[float, float, float]]:
+        if value is None:
+            return None
+        parts = [float(x.strip()) for x in value.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Expected 3 comma-separated floats, got: {value}")
+        return (parts[0], parts[1], parts[2])
+
+    obb_center = parse_vec3(args.obb_center)
+    obb_rotation = parse_vec3(args.obb_rotation)
+    obb_scale = parse_vec3(args.obb_scale)
 
     exporter = ExportGaussianSplat(
         load_config=args.load_config,

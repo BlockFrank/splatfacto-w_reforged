@@ -54,21 +54,6 @@ def quat_to_rotmat(quats: Tensor) -> Tensor:
     )
     return rot.reshape(quats.shape[:-1] + (3, 3))
 
-def get_sh_coeffs(self, cam_idx: Optional[int] = None) -> torch.Tensor:
-    """
-    Returns SH coefficients [N, SH, 3] for a given camera index
-    or default / average appearance if cam_idx is None.
-    """
-    if cam_idx is not None:
-        embed = self.appearance_embeds(torch.tensor(cam_idx, device=self.device))
-    elif self.config.use_avg_appearance:
-        embed = self.appearance_embeds.weight.mean(dim=0)
-    else:
-        embed = self.appearance_embeds(torch.tensor(0, device=self.device))
-
-    embed_expanded = embed.unsqueeze(0).expand(self.appearance_features.shape[0], -1)
-    return self.color_nn(embed_expanded, self.appearance_features)
-
 def random_quat_tensor(num: int, *, device: Optional[torch.device] = None) -> Tensor:
     """Sample random quaternions."""
     u = torch.rand(num, device=device)
@@ -177,9 +162,20 @@ class SplatfactoWModel(Model):
     ):
         self.seed_points = seed_points
         super().__init__(*args, **kwargs)
+    def get_sh_coeffs(self, cam_idx: Optional[int] = None) -> torch.Tensor:
+        device=self.appearance_features.device
+        if cam_idx is not None:
+            embed = self.appearance_embeds(torch.tensor(cam_idx, device=self.appearance_features.device))
+        elif self.config.use_avg_appearance:
+            embed = self.appearance_embeds.weight.mean(dim=0)
+        else:
+            embed = self.appearance_embeds(torch.tensor(0, device=self.appearance_features.device))
+
+        embed_expanded = embed.unsqueeze(0).expand(self.appearance_features.shape[0], -1)
+        return self.color_nn(embed_expanded, self.appearance_features)
 
     def populate_modules(self) -> None:
-        device = self.device
+        device = torch.device(self.kwargs["device"])
         if self.seed_points is not None and not self.config.random_init:
             means = torch.nn.Parameter(self.seed_points[0].to(device))
         else:
